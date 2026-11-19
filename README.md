@@ -6,6 +6,37 @@ Prepares an R36S SD card running dArkOS to run CMU 15-112 `cmu_graphics` games.
 
 ## Setting up a card
 
+### Before running anything from this repo
+
+These steps follow the
+[dArkOSRE-R36 firmware installation guide](https://github.com/southoz/dArkOS-G80CA-RE/wiki/Firmware-Installation).
+Check it for anything that has changed since this was written.
+
+1. **Download the image.** Get the latest release from
+   [dArkOSRE-R36 releases](https://github.com/southoz/dArkOSRE-R36/releases). It comes as a
+   `.7z` archive, such as `dArkOSRE_R36_trixie_03082026.7z`. Extract the `.img` with 7-Zip
+   (`7z x <file>.7z`). The release page gives a SHA1 hash, so you can check the image with
+   `sha1sum`.
+2. **Flash the image**. Use Raspberry Pi Imager, Rufus, USB Image
+   Tool or `dd`. Don't use Balena Etcher, which often produces failed flashes on this device.
+3. **Install the DTB files for the console.** The console won't boot until the BOOT
+   partition has the DTB files for its motherboard and panel. Our consoles use
+   **R36S-V22 2024-12-18**.
+   * On Linux or macOS, delete every `.dtb` file from the root of the BOOT partition. Then
+     copy the files from `dtb/r36s/R36S-V22 2024-12-18/` to the root of BOOT.
+   * On Windows, double-click `SELECT MODEL` on the BOOT partition, enter the number for
+     `R36S-V22 2024-12-18`, and press `Y` to confirm.
+
+   Other consoles need different files. Find the console's motherboard ID in the
+   [supported systems table](https://github.com/southoz/dArkOSRE-R36#supported-systems).
+4. **First boot.** Insert the
+   card and power on. The first boot takes about 2 to 3 minutes and ends in
+   EmulationStation.
+5. **Install PortMaster.** Go to **Start → Options → Tools → Install PortMaster**.
+6. **Shut the console down fully**, then take the card out.
+
+### Running setup.sh
+
 On a Linux PC, plug in the SD card and run:
 
 ```bash
