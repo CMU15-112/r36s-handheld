@@ -48,7 +48,7 @@ re-run on a card that's already set up.
 
 | Partition | Installed |
 |---|---|
-| ROOTFS | pygame 2.6.1, pycairo 1.27.0, cmu_graphics 1.1.44 with speed patches, Pillow 13.0.0, numpy 2.5.5, pymunk 7.3.1, perlin-noise 1.14, pathfinding 1.0.23 and pytmx 3.32, in `/usr/local/lib/python3.13/dist-packages` |
+| ROOTFS | cmu_graphics 3.0.2 with speed patches, cmu_graphics_helpers 0.1.11, certifi, pygame 2.6.1 (read by `joystick.py` for the gamepad), Pillow 13.0.0, numpy 2.5.5, pymunk 7.3.1, perlin-noise 1.14, pathfinding 1.0.23 and pytmx 3.32, in `/usr/local/lib/python3.13/dist-packages`. The cage 0.2.0 Wayland compositor with its libraries and keymaps (from Debian trixie arm64), in `/usr/local/lib/r36s-cage` |
 | EASYROMS | The shared launcher in `ports/cmu_libs`, plus the demo games in `ports` |
 
 To keep the menus simple, the script also removes:
@@ -61,7 +61,9 @@ To keep the menus simple, the script also removes:
   `es_systems.cfg.r36s-cmu.bak`. RetroArch itself stays installed, because the emulators
   use it.
 
-Downloads are pinned, checksum-verified and cached in `~/.cache/r36s-cmu`. After
+cmu_graphics_helpers has no aarch64 wheel on PyPI, so a prebuilt one ships in
+[wheels/](wheels/). Every other download is pinned, checksum-verified and cached in
+`~/.cache/r36s-cmu`. The local wheel is checksum-verified too. After
 installing, the script remounts both partitions and compares every file against what it
 wrote.
 
@@ -80,19 +82,41 @@ EASYROMS/ports/My Game.sh
 
 Every menu entry is a copy of [payload/game.sh](payload/game.sh), which runs
 `ports/cmu_libs/launch.sh`. The launcher finds the game folder from the entry's filename,
-turns on the screen scaling and gamepad translation, pins the clocks at their maximum, and
-sends the game's output to `log.txt` in its folder.
+turns on screen scaling (`CMU_FIT=1`), turns off the MVC checker (`CMU_MVC_CHECK=0`) and
+turns on fastpath's near-identical speedups (`CMU_APPROX=1`) to save frame time, pins the
+clocks at their maximum, and sends the game's output to `log.txt` in its folder.
+
+cmu_graphics 3 opens a Wayland window, and dArkOS has no desktop, so the launcher runs
+each game inside [cage](https://github.com/cage-kiosk/cage), a compositor that shows one
+fullscreen app and exits when it does. cage runs as root, without a login session, and
+draws in software (`WLR_RENDERER=pixman`), so it doesn't depend on the console's GPU
+driver. Its libraries stay in `/usr/local/lib/r36s-cage/lib` and are only on cage's own
+library path, so they can't replace the console's. The game gets just the two it needs,
+libwayland-client and libxkbcommon, from `r36s-cage/client`.
+
+cmu_graphics 3 doesn't use pygame, so `joystick.py` reads the gamepad through pygame
+itself, on each step, with SDL's dummy display (no window). The launcher sets
+`CMU_R36S_JOY=1`, which makes it renumber the R36S buttons like the CMU arcade box and quit
+on Select+Start.
 
 The first launch on a new card compiles the libraries, because games can't write to ROOTFS
 at runtime.
+
+setup.sh copies [payload/cmu_fixes.py](payload/cmu_fixes.py) and
+[payload/fastpath.py](payload/fastpath.py) into the installed `cmu_graphics` package and
+imports them at the end of `cmu_graphics/__init__.py`, so every game gets the bug fixes and
+speed patches without importing anything. `CMU_FAST=0` turns them off, and the top of
+`fastpath.py` lists its other settings.
 
 ## Files
 
 ```
 setup.sh              prepares the card
 STUDENT_GUIDE.md      how students get a game running on the console
-payload/fastpath.py   speed patches, screen scaling and gamepad translation for cmu_graphics
 payload/launch.sh     shared launcher, installed to ports/cmu_libs
 payload/game.sh       menu entry for one game
+payload/fastpath.py   speed patches and screen scaling for cmu_graphics 3, installed into cmu_graphics
+payload/cmu_fixes.py  fixes for bugs in cmu_graphics 3.0.2, installed into cmu_graphics
+wheels/               prebuilt aarch64 cmu_graphics_helpers wheel
 demo_games/           Joystick Tester, CMU Swarm and CMU FPS Demo, installed on every card
 ```

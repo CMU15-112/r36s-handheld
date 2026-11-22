@@ -111,7 +111,7 @@ and the values from both sticks.
 
 ### Testing on your laptop
 
-`joystick.py` runs fine on a laptop with no controller attached, but your gamepad code
+`joystick.py` needs pygame (`pip install pygame`). It runs fine on a laptop with no controller attached, but your gamepad code
 won't get any input there. To keep testing on your laptop, leave your keyboard handlers
 in place alongside the joystick ones. The console ignores them.
 
@@ -192,4 +192,3 @@ Some features don't work on the console:
 * `app.getTextInput()` and `app.showMessage()` open desktop windows, so they can't run.
 * Only the [preinstalled packages](#preinstalled-packages) are on the console. Any other
   package written entirely in Python usually works if you copy its folder next to `main.py`.
-* Only one long music track (over 1 MB) can play at a time.

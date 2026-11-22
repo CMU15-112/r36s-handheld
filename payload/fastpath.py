@@ -1,45 +1,93 @@
 """Speed patches for cmu_graphics on slow handhelds (R36S, RK3326).
 
-Installed from cmu_graphics/__init__.py unless CMU_FAST=0. Every patch keeps the
+Usage: put this file next to your game and import it:
+
+    from cmu_graphics import *
+    import fastpath
+
+(Importing it before or after cmu_graphics both work.) CMU_FAST=0 in the
+environment turns the patches off without editing the game.
+
+Ported to cmu_graphics 3.x. 3.x no longer uses pygame: wyvern (cmu_graphics_helpers,
+built on winit + softbuffer + tiny-skia + rodio) owns the window, the event loop,
+input and sound, and calls App.on_event(event, surface) with 'step', 'redraw',
+mouse/key and 'resize' events. Differences from 2.x this file works around:
+  - colours are plain RGBA (2.x swapped them to BGRA);
+  - there is no pixel read-back (no surface.data): the frame and rendered text are
+    read back through Canvas.save_png (to /dev/shm when available), and only when
+    it pays off (static layer captures; labels drawn many times);
+  - the window surface keeps its pixels between 'redraw' events, so a frame where
+    nothing changed is simply not redrawn;
+  - the surface may be HiDPI: device pixels per app unit = surface.width / window
+    width (from the 'resize' events);
+  - no gamepad support at all (no pygame events), so CMU_R36S_JOY is gone;
+  - sound is decoded on the fly by rodio, so the 2.x sound patch is gone.
+
+Every patch keeps the
 original behaviour; anything the fast paths don't handle falls back to the
 original code, so error messages for bad arguments stay the same.
 
 1. redrawAll runs once per rendered frame instead of after every event handler
    (stock code reruns it after onStep, onKeyHold, onKeyPress... and throws all but
    the last result away). Frames where nothing changed are skipped.
-2. The cairo frame is blitted as an opaque RGBX surface instead of RGBA, so SDL
-   copies pixels instead of alpha-blending them onto an opaque screen.
-3. drawRect/Oval/Circle/Line/Polygon/RegularPolygon/Star/Arc/Label/Image with
+2. drawRect/Oval/Circle/Line/Polygon/RegularPolygon/Star/Arc/Label/Image with
    ordinary arguments (including rotateAngle, dashes, opacity, align) skip the
-   validated shape-object machinery and draw straight to cairo.
-4. Translation lookups, colours, rgb() objects, text measurements, rendered text,
-   resized and rotated images are cached.
-5. Shapes are drawn the moment drawX() is called (no shape list), and an unchanged
+   validated shape-object machinery and draw straight to the canvas.
+3. Translation lookups, colours, rgb() objects, text measurements, rendered text
+   (once drawn often enough) and resized images are cached. So is each built shape,
+   by its exact arguments: a call identical to a recent one (tile map, star field,
+   HUD) skips argument checks and geometry. Fonts are selected only when they change.
+4. Shapes are drawn the moment drawX() is called (no shape list), and an unchanged
    start of the frame (background, tile map...) is pasted from a cached bitmap
-   instead of being redrawn (StaticPrefix; CMU_STATIC_LAYER=0 disables it).
-6. Sound loads on first play (stock decodes every file to raw audio up front:
-   a 26-minute mp3 is ~280 MB). Long files stream from disk instead.
+   instead of being redrawn (StaticPrefix; CMU_STATIC_LAYER=0 disables it). The
+   layer times itself and stops while pasting is slower than just drawing.
 
-Opt-in via environment (the R36S launcher sets these):
-  CMU_FIT=1        scale the app to fill the screen (800x600 arcade games -> 640x480),
-                   rendered at screen resolution, not resized afterwards. Mouse
-                   positions are mapped back to app coordinates and a cursor is drawn
-                   (gptokeyb can drive the mouse from a stick).
-  CMU_R36S_JOY=1   translate the R36S gamepad to the CMU arcade box's joystick numbering
-                   (see STUDENT_GUIDE.md); Select+Start quits.
-  CMU_ANTIALIAS=fast|none   cheaper shape edges for very heavy games.
+Opt-in via environment:
+  CMU_FIT=1   open fullscreen and scale the app to fill the screen keeping its aspect
+              ratio (800x600 arcade games -> 640x480), rendered at screen resolution.
+              The app keeps its own width/height; mouse positions are mapped back.
+  CMU_MVC_CHECK=0|N   the MVC checker (which hashes all of `app` before and after every
+              redrawAll; ~20% of frame time in a small app, more in big ones) runs on
+              every frame by default. 0 turns it off; N checks one frame in N, so a
+              redrawAll that changes `app` is still reported, just a little later (or
+              missed if it only happens on unchecked frames). A game that sets
+              app.disableMvcChecker = True itself is never checked.
+              Caveat with the checker off: fastpath runs redrawAll once per *rendered*
+              frame (not after every event like stock, and not at all for unchanged
+              frames), so a redrawAll that changes `app` misbehaves differently than in
+              stock.
+  CMU_APPROX=1  speedups whose output is very close to, but not pixel-identical with,
+              the stock drawing:
+                - labels whose text keeps changing are drawn from cached images of
+                  their characters (tiny-skia anti-aliases a lone glyph slightly
+                  differently from the same glyph in a string; up to ~10/255);
+                - rotated images are drawn from copies pre-rotated to the nearest 2
+                  degrees, placed on whole pixels (rotating while drawing costs ~10x
+                  a plain copy).
+
+Measuring: fastbench.py renders a game's frames off-screen (no window, so it runs
+over ssh on the handheld) and reports ms per frame; --save/--diff check that a change
+keeps the output pixel-identical. On the handheld itself, also check the CPU
+governor (cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor): `performance`
+keeps the clock up for a game loop that ondemand/schedutil may underclock.
 """
 
 import gc
 import math
 import os
+import struct
+import sys
+import tempfile
 import time
+import zlib
 
-import cairo
-import pygame
+import cmu_graphics as _pkg
+from cmu_graphics import shape_logic as sl
+from cmu_graphics import cmu_graphics as cg
+from cmu_graphics.deps import wyvern
 
-from . import shape_logic as sl
-from . import cmu_graphics as cg
+# CMU_APPROX=1: speedups whose output is close to, but not exactly, the stock drawing.
+APPROX = os.environ.get('CMU_APPROX') == '1'
 
 TWO_PI = 2 * math.pi
 DEG = math.pi / 180
@@ -106,30 +154,53 @@ _colorCache = {}
 
 
 def color(c, alpha):
-    """cairo source tuple for a colour, None for no colour, FAIL to fall back.
-    Channels are BGRA-swapped like shape_logic does (the frame is read back as RGBA)."""
+    """Canvas source tuple (r, g, b, a) for a colour, None for no colour, FAIL to fall back."""
     if c is None:
         return None
     tc = type(c)
     if tc is str:
-        bgr = _colorCache.get(c)
-        if bgr is None:
+        rgb3 = _colorCache.get(c)
+        if rgb3 is None:
             v = sl.CSS3_COLORS_TO_RGB.get(toEnglish(c, 'color').lower())
             if v is None:
                 return FAIL
             d = v.__dict__
-            bgr = _colorCache[c] = (d['_blue'] / 255, d['_green'] / 255, d['_red'] / 255)
-        return bgr + (alpha,)
+            rgb3 = _colorCache[c] = (d['_red'] / 255, d['_green'] / 255, d['_blue'] / 255)
+        return rgb3 + (alpha,)
     if tc is sl.RGB:
         d = c.__dict__
         r, g, b = d['_red'], d['_green'], d['_blue']
         if not (_num(r) and _num(g) and _num(b)):
             return FAIL
-        return (b / 255, g / 255, r / 255, alpha)
+        return (r / 255, g / 255, b / 255, alpha)
     return FAIL  # gradients etc.
 
 
 _extentsCache = {}
+_glyphCache = {}
+_measureCtx = {}  # face -> canvas with that font selected (select_font_face is slow)
+
+
+def measureCtx(face):
+    mc = _measureCtx.get(face)
+    if mc is None:
+        mc = _measureCtx[face] = wyvern.ImageSurface(1, 1).canvas
+        mc.select_font_face(*face)
+    return mc
+
+
+def glyphExtents(face, size, ch):
+    """(x bearing, y bearing, width, height, x advance) of one character."""
+    k = (face, size, ch)
+    e = _glyphCache.get(k)
+    if e is None:
+        mc = measureCtx(face)
+        if len(_glyphCache) > 20000:
+            _glyphCache.clear()
+        mc.set_font_size(size)
+        xb, yb, w, h, xa, ya = mc.text_extents(ch)
+        e = _glyphCache[k] = (xb, yb, w, h, xa)
+    return e
 
 
 def textExtents(face, size, text):
@@ -138,13 +209,10 @@ def textExtents(face, size, text):
     if e is None:
         if len(_extentsCache) > 5000:
             _extentsCache.clear()
-        fc = sl.fontCtx
-        fc.save()
-        fc.select_font_face(*face)
-        fc.set_font_size(size)
-        xb, yb, w, h, xa, ya = fc.text_extents(text)
-        fc.restore()
-        e = _extentsCache[k] = (xb, yb, w, xa)
+        mc = measureCtx(face)
+        mc.set_font_size(size)
+        xb, yb, w, h, xa, ya = mc.text_extents(text)
+        e = _extentsCache[k] = (xb, yb, w, h, xa)
     return e
 
 
@@ -157,6 +225,100 @@ def fontFace(font, bold, italic):
     if f is None:
         f = _fontCache[k] = sl.getFont(font, bold, italic)
     return f
+
+
+# ---------------------------------------------------------------- pixel read-back
+
+_SHM = '/dev/shm'
+_SNAP_DIR = _SHM if os.path.isdir(_SHM) and os.access(_SHM, os.W_OK) else tempfile.gettempdir()
+_SNAP_PATH = os.path.join(_SNAP_DIR, 'cmu_fastpath_%d.png' % os.getpid())
+
+
+def snapshot(ctx):
+    """The canvas' pixels as a WyvernImage (device pixels), via a PNG round trip."""
+    ctx.save_png(_SNAP_PATH)
+    try:
+        return wyvern.load_image_from_path(_SNAP_PATH)
+    finally:
+        _unlink()
+
+
+def _unlink():
+    try:
+        os.remove(_SNAP_PATH)
+    except OSError:
+        pass
+
+
+_PIL_BPP = {'L': 1, 'LA': 2, 'RGB': 3, 'RGBA': 4}
+
+
+def readPixels(ctx):
+    """(width, height, bytes per pixel, pixel bytes) of the canvas."""
+    ctx.save_png(_SNAP_PATH)
+    try:
+        try:
+            from PIL import Image  # much faster than decodePng, when it's installed
+        except ImportError:
+            Image = None
+        if Image is not None:
+            with Image.open(_SNAP_PATH) as im:
+                if im.mode in _PIL_BPP:
+                    im.load()
+                    return im.width, im.height, _PIL_BPP[im.mode], im.tobytes()
+        with open(_SNAP_PATH, 'rb') as f:
+            return decodePng(f.read())
+    finally:
+        _unlink()
+
+
+def decodePng(data):
+    """Minimal decoder for the 8-bit, non-interlaced PNGs save_png writes."""
+    if data[:8] != b'\x89PNG\r\n\x1a\n':
+        raise ValueError('not a PNG')
+    pos, idat, w, h, bpp = 8, [], 0, 0, 4
+    while pos < len(data):
+        n, typ = struct.unpack('>I4s', data[pos:pos + 8])
+        body = data[pos + 8:pos + 8 + n]
+        pos += 12 + n
+        if typ == b'IHDR':
+            w, h, depth, ctype, _, _, interlace = struct.unpack('>IIBBBBB', body)
+            if depth != 8 or interlace or ctype not in (0, 2, 4, 6):
+                raise ValueError('unsupported PNG')
+            bpp = {0: 1, 2: 3, 4: 2, 6: 4}[ctype]
+        elif typ == b'IDAT':
+            idat.append(body)
+        elif typ == b'IEND':
+            break
+    raw = zlib.decompress(b''.join(idat))
+    stride = w * bpp
+    out = bytearray(h * stride)
+    prev = bytes(stride)
+    for y in range(h):
+        start = y * (stride + 1)
+        f = raw[start]
+        line = bytearray(raw[start + 1:start + 1 + stride])
+        if f == 1:
+            for i in range(bpp, stride):
+                line[i] = (line[i] + line[i - bpp]) & 255
+        elif f == 2:
+            for i in range(stride):
+                line[i] = (line[i] + prev[i]) & 255
+        elif f == 3:
+            for i in range(stride):
+                left = line[i - bpp] if i >= bpp else 0
+                line[i] = (line[i] + ((left + prev[i]) >> 1)) & 255
+        elif f == 4:
+            for i in range(stride):
+                a = line[i - bpp] if i >= bpp else 0
+                b = prev[i]
+                c = prev[i - bpp] if i >= bpp else 0
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                line[i] = (line[i] + (a if pa <= pb and pa <= pc else (b if pb <= pc else c))) & 255
+        out[y * stride:(y + 1) * stride] = line
+        prev = line
+    return w, h, bpp, out
 
 
 # ---------------------------------------------------------------- argument checks
@@ -198,7 +360,6 @@ _STAR_KW = _SHAPE_KW | {'roundness'}
 _LINE_KW = frozenset(['fill', 'opacity', 'rotateAngle', 'dashes', 'visible', 'db', 'lineWidth', 'arrowStart', 'arrowEnd'])
 _LABEL_KW = frozenset(['fill', 'border', 'borderWidth', 'opacity', 'rotateAngle', 'align', 'visible', 'db', 'bold', 'italic', 'size', 'font'])
 _IMAGE_KW = _SHAPE_KW | {'width', 'height'}
-_NO_STYLE = (None, None, 2, None, None, 0)
 
 
 _styleCache = {}
@@ -207,6 +368,17 @@ _styleCache = {}
 def style(kw, allowed, defaultAlign):
     """Common keyword handling, memoized on the exact keywords, value types and values.
     Returns (fill, border, borderWidth, alignAttrs, dash, rotateAngle) or FAIL."""
+    rot = kw.get('rotateAngle', 0)
+    if rot and type(rot) is not bool:
+        # Usually animated: keep it out of the cache key, or every call would miss.
+        if not _num(rot):
+            return FAIL
+        kw = dict(kw)
+        del kw['rotateAngle']
+        s = style(kw, allowed, defaultAlign)
+        if s is FAIL or 'rotateAngle' not in allowed:
+            return FAIL
+        return s[:5] + (rot,)
     try:
         k = (allowed, defaultAlign, tuple(kw.items()), tuple(map(type, kw.values())))
         s = _styleCache.get(k)
@@ -264,24 +436,50 @@ def alignLeftTop(aa, x, y, w, h):
 
 
 class FastShape(object):
-    """Stand-in for a shape in the top-level group; only knows how to draw itself."""
+    """A fast-path draw call: a function and its pre-computed arguments."""
 
     __slots__ = ('fn', 'args')
-    isGroup = False
 
     def __init__(self, fn, args):
         self.fn = fn
         self.args = args
 
-    def draw(self, ctx):
-        self.fn(ctx, *self.args)
 
-    def hits(self, x, y):
-        return False
+def toDevice(ctx):
+    """Switch ctx from app units to device pixels (S.dev maps app -> device)."""
+    d, ox, oy = S.dev
+    if d != 1 or ox or oy:
+        ctx.transform(1 / d, 0, 0, 1 / d, -ox / d, -oy / d)
 
-    @property
-    def studentShape(self):
-        return self
+
+_bezCache = {}
+
+
+def unitBezier(start, sweep):
+    """shape_logic's own Bezier approximation of a unit circle arc (90-degree
+    fragments, counter-clockwise from east), so edges match the stock drawing."""
+    k = (start, sweep)
+    bp = _bezCache.get(k)
+    if bp is None:
+        if len(_bezCache) > 5000:
+            _bezCache.clear()
+        bp = _bezCache[k] = [tuple(p) for p in sl.Oval.getBezierPoints(start, sweep, True)]
+    return bp
+
+
+def _curves(ctx, bp, cx, cy, rx, ry):
+    for i in range(0, len(bp), 4):
+        (x1, y1), (x2, y2), (x3, y3) = bp[i + 1], bp[i + 2], bp[i + 3]
+        ctx.curve_to(cx + rx * x1, cy + ry * y1, cx + rx * x2, cy + ry * y2, cx + rx * x3, cy + ry * y3)
+
+
+def _ellipsePath(ctx, cx, cy, rx, ry):
+    # wyvern applies the transform at fill time, so build the ellipse directly.
+    bp = unitBezier(0, 360)
+    ctx.new_path()
+    ctx.move_to(cx + rx * bp[0][0], cy + ry * bp[0][1])
+    _curves(ctx, bp, cx, cy, rx, ry)
+    ctx.close_path()
 
 
 def rotateAbout(ctx, deg, ax, ay):
@@ -302,7 +500,7 @@ def paintPath(ctx, fill, border, bw, dash, roundJoin=False):
         if dash:
             ctx.set_dash(dash)
         if roundJoin:
-            ctx.set_line_join(cairo.LINE_JOIN_ROUND)
+            ctx.set_line_join(wyvern.LineJoin.ROUND)
         ctx.set_line_width(bw * 2)
         ctx.stroke()
     ctx.new_path()
@@ -351,57 +549,42 @@ def drawOvalFast(ctx, cx, cy, rx, ry, fill, border, bw, dash, rot):
     if rx == ry:
         if border is None or not bw:
             if fill is not None:
-                ctx.new_path()
-                ctx.arc(cx, cy, rx, 0, TWO_PI)
+                _ellipsePath(ctx, cx, cy, rx, rx)
                 ctx.set_source_rgba(*fill)
                 ctx.fill()
             return
         if rx > bw / 2 and not dash:
             ctx.save()
-            ctx.new_path()
             if fill is not None:
-                ctx.arc(cx, cy, rx, 0, TWO_PI)
+                _ellipsePath(ctx, cx, cy, rx, rx)
                 ctx.set_source_rgba(*fill)
                 ctx.fill()
-            ctx.arc(cx, cy, rx - bw / 2, 0, TWO_PI)
-            ctx.close_path()
+            _ellipsePath(ctx, cx, cy, rx - bw / 2, rx - bw / 2)
             strokeInset(ctx, border, bw, dash)
             ctx.restore()
             return
     ctx.save()
     if rot:
         rotateAbout(ctx, rot, cx, cy)
-    ctx.new_path()
-    if rx == ry:
-        ctx.arc(cx, cy, rx, 0, TWO_PI)
-    else:
-        ctx.save()
-        ctx.translate(cx, cy)
-        ctx.scale(rx, ry)
-        ctx.arc(0, 0, 1, 0, TWO_PI)
-        ctx.restore()
-    ctx.close_path()
+    _ellipsePath(ctx, cx, cy, rx, ry)
     paintPath(ctx, fill, border, bw, dash)
     ctx.restore()
 
 
-def drawPolyFast(ctx, pts, fill, border, bw, dash):
+def _polyPath(ctx, pts):
     # Same path as utils.makePolygonPath: start at the last point.
+    ctx.move_to(pts[-2], pts[-1])
+    for i in range(0, len(pts), 2):
+        ctx.line_to(pts[i], pts[i + 1])
+    ctx.close_path()
+
+
+def drawPolyFast(ctx, pts, fill, border, bw, dash):
     ctx.save()
     ctx.new_path()
-    ctx.move_to(pts[-2], pts[-1])
-    for i in range(0, len(pts), 2):
-        ctx.line_to(pts[i], pts[i + 1])
-    ctx.close_path()
+    _polyPath(ctx, pts)
     paintPath(ctx, fill if len(pts) > 4 else None, border, bw, dash)
     ctx.restore()
-
-
-def _polyPath(ctx, pts):
-    ctx.move_to(pts[-2], pts[-1])
-    for i in range(0, len(pts), 2):
-        ctx.line_to(pts[i], pts[i + 1])
-    ctx.close_path()
 
 
 def drawInsetPolyFast(ctx, pts, inner, fill, border, bw, dash):
@@ -421,13 +604,11 @@ def drawArcFast(ctx, cx, cy, rx, ry, start, sweep, fill, border, bw, dash, rot):
     if rot:
         rotateAbout(ctx, rot, cx, cy)
     ctx.new_path()
+    # wyvern's arc() won't join to the centre, so build the pie from shape_logic's curves
+    bp = unitBezier(start, sweep)
     ctx.move_to(cx, cy)
-    ctx.save()
-    ctx.translate(cx, cy)
-    ctx.scale(rx, ry)
-    # CPCS arcs: angle 0 = east, counter-clockwise on screen
-    ctx.arc_negative(0, 0, 1, -start * DEG, -(start + sweep) * DEG)
-    ctx.restore()
+    ctx.line_to(cx + rx * bp[0][0], cy + ry * bp[0][1])
+    _curves(ctx, bp, cx, cy, rx, ry)
     ctx.close_path()
     paintPath(ctx, fill, border, bw, dash, roundJoin=True)
     ctx.restore()
@@ -456,83 +637,226 @@ def _quarter(v):
     return i, f
 
 
+# Reading text back costs ~25 drawings of it (a PNG round trip), so a label is only
+# turned into a cached image once it has been drawn this many times unchanged.
+TEXT_CACHE_AFTER = 30
+_textUses = {}
 _maskCache = {}
+_INVERT = bytes(255 - i for i in range(256))
 
 
 def textMask(face, size, text, fx, fy):
-    """Alpha mask of the text, rendered once at this size and sub-pixel offset."""
+    """Coverage of the text (one byte per pixel), rendered once at this size and
+    sub-pixel offset. wyvern surfaces start opaque white and have no operators, so
+    the text is drawn black on white and the coverage is 255 - the red channel."""
     k = (face, size, text, fx, fy)
     m = _maskCache.get(k)
     if m is None:
         if len(_maskCache) > 3000:
             _maskCache.clear()
-        fc = sl.fontCtx
-        fc.save()
-        fc.select_font_face(*face)
-        fc.set_font_size(size)
-        xb, yb, w, h, xa, ya = fc.text_extents(text)
-        fc.restore()
+        xb, yb, w, h, xa = textExtents(face, size, text)
         pad = 2
         ox = pad - math.floor(xb)
         oy = pad - math.floor(yb)
-        surf = cairo.ImageSurface(
-            cairo.FORMAT_A8, int(math.ceil(w)) + 2 * pad + 2, int(math.ceil(h)) + 2 * pad + 2
-        )
-        c = cairo.Context(surf)
+        mw = int(math.ceil(w)) + 2 * pad + 2
+        mh = int(math.ceil(h)) + 2 * pad + 2
+        c = wyvern.ImageSurface(mw, mh).canvas
         c.select_font_face(*face)
         c.set_font_size(size)
+        c.set_source_rgba(0, 0, 0, 1)
+        c.new_path()
         c.move_to(ox + fx, oy + fy)
-        c.show_text(text)
-        surf.flush()
-        m = _maskCache[k] = (surf, ox, oy)
+        c.text_path(text)  # same outlines as shape_logic's labels
+        c.fill()
+        pw, ph, bpp, px = readPixels(c)
+        if (pw, ph) != (mw, mh):
+            raise ValueError('unexpected read-back size')
+        m = _maskCache[k] = (bytes(px[0::bpp]).translate(_INVERT), mw, mh, ox, oy)
     return m
+
+
+_alphaTables = {}
+_textCache = {}
+
+
+def _scaleTable(c):
+    """Byte table v -> v * c for a channel value c in 0..1 (premultiplying)."""
+    ic = int(round(c * 255))
+    tbl = _alphaTables.get(ic)
+    if tbl is None:
+        tbl = _alphaTables[ic] = bytes((v * ic + 127) // 255 for v in range(256))
+    return tbl
+
+
+def textImage(face, size, text, fx, fy, fill):
+    """The text as a WyvernImage in its fill colour, opacity baked into the alpha.
+    WyvernImage pixels are premultiplied RGBA, so each colour channel is
+    coverage * colour."""
+    k = (face, size, text, fx, fy, fill)
+    hit = _textCache.get(k)
+    if hit is not None:
+        return hit
+    if len(_textCache) > 3000:
+        _textCache.clear()
+    cov, mw, mh, ox, oy = textMask(face, size, text, fx, fy)
+    r, g, b, a = fill
+    alpha = cov.translate(_scaleTable(a)) if a < 1 else cov
+    buf = bytearray(mw * mh * 4)
+    buf[0::4] = alpha.translate(_scaleTable(r))
+    buf[1::4] = alpha.translate(_scaleTable(g))
+    buf[2::4] = alpha.translate(_scaleTable(b))
+    buf[3::4] = alpha
+    hit = _textCache[k] = (wyvern.WyvernImage(buf, mw, mh, mw * 4), ox, oy)
+    return hit
 
 
 def textBox(face, size, text):
     """(ink width, x adjustment) as shape_logic measures a label."""
-    xb, yb, w, xa = textExtents(face, size, text)
+    xb, yb, w, h, xa = textExtents(face, size, text)
     if len(text) > 0 and (text[0] == ' ' or text[-1] == ' '):
         return max(w, xa), 0
     return w, xb
 
 
-def drawLabelFast(ctx, text, x, y, face, size, fill, border, bw, rot, cx, cy, ax, xattr):
+def stampText(ctx, text, x, y, face, size, fill, ax, xattr):
+    """Draw the label from a cached image in device pixels (no resampling when the
+    app is scaled). Returns False if the text isn't worth caching (yet)."""
+    d, ox, oy = S.dev
+    dsize = size * d
+    if d != 1:
+        # Glyphs are hinted at the device size, so the text's width isn't exactly
+        # d times its app-size width: align it at the device size.
+        dw, dadj = textBox(face, dsize, text)
+        anchor = ax * d + ox
+        left = anchor if xattr == 'left' else (anchor - dw if xattr == 'right' else anchor - dw / 2)
+        ix, fx = _quarter(left - dadj)
+    else:
+        ix, fx = _quarter(x + ox)
+    iy, fy = _quarter(y * d + oy)
+    k = (face, dsize, text, fx, fy, fill)
+    if k not in _textCache:
+        n = _textUses.get(k, 0) + 1
+        if n < TEXT_CACHE_AFTER:
+            if len(_textUses) > 20000:
+                _textUses.clear()
+            _textUses[k] = n
+            return APPROX and stampGlyphs(ctx, text, ix, fx, iy, fy, face, dsize, fill)
+        _textUses.pop(k, None)
+        try:
+            textImage(face, dsize, text, fx, fy, fill)
+        except Exception:
+            _textCache[k] = None  # read-back failed: always draw this one as a path
+            return False
+    hit = _textCache[k]
+    if hit is None:
+        return False
+    img, mox, moy = hit
     ctx.save()
     ctx.new_path()
-    ctx.set_source_rgba(*fill)
-    m = ctx.get_matrix()
-    if border is None or not bw:
-        if not rot and m.xy == 0 and m.yx == 0 and m.xx == m.yy:
-            # Stamp a cached mask in device pixels (no resampling when the app is scaled).
-            s = m.xx
-            if s != 1:
-                # Glyphs are hinted at the device size, so the text's width isn't
-                # exactly s times its app-size width: align it at the device size.
-                dw, dadj = textBox(face, size * s, text)
-                anchor = ax * s + m.x0
-                left = anchor if xattr == 'left' else (anchor - dw if xattr == 'right' else anchor - dw / 2)
-                ix, fx = _quarter(left - dadj)
-            else:
-                ix, fx = _quarter(x + m.x0)
-            iy, fy = _quarter(y * s + m.y0)
-            mask, ox, oy = textMask(face, size * s, text, fx, fy)
-            ctx.identity_matrix()
-            ctx.mask_surface(mask, ix - ox, iy - oy)
-            ctx.restore()
+    toDevice(ctx)
+    ctx.draw_image(img, ix - mox, iy - moy, 1.0)
+    ctx.restore()
+    return True
+
+
+# CMU_APPROX: labels whose text keeps changing (scores, timers) are drawn from cached
+# images of their characters. Not exact: tiny-skia anti-aliases a glyph filled on its
+# own slightly differently (up to ~10/255) from the same glyph in a whole string.
+# One glyph image costs a small read-back, so a glyph is cached once it has been
+# drawn this many times.
+GLYPH_CACHE_AFTER = 3
+_glyphUses = {}
+_glyphPlan = {}
+
+
+def glyphPlan(face, dsize, text, fx):
+    """[(x offset, glyph)] for the inked characters of text drawn at sub-pixel phase
+    fx, or None when two characters would share a pixel column (overlapping
+    anti-aliased edges composite differently from one fill of the whole string)."""
+    k = (face, dsize, text, fx)
+    plan = _glyphPlan.get(k, FAIL)
+    if plan is not FAIL:
+        return plan
+    if len(_glyphPlan) > 5000:
+        _glyphPlan.clear()
+    plan = []
+    pos = 0
+    lastRight = None
+    for ch in text:
+        xb, yb, w, h, xa = glyphExtents(face, dsize, ch)
+        if xa != int(xa):
+            plan = None
+            break
+        if w > 0 or h > 0:
+            left = math.floor(pos + fx + xb)
+            if lastRight is not None and left < lastRight:
+                plan = None
+                break
+            lastRight = math.ceil(pos + fx + xb + w)
+            plan.append((int(pos), ch))
+        pos += xa
+    _glyphPlan[k] = plan
+    return plan
+
+
+def stampGlyphs(ctx, text, ix, fx, iy, fy, face, dsize, fill):
+    """Draw the label as one cached image per character. False if it can't (yet)."""
+    plan = glyphPlan(face, dsize, text, fx)
+    if not plan:
+        return False
+    ready = True
+    for _, ch in plan:
+        k = (face, dsize, ch, fx, fy, fill)
+        if k not in _textCache:
+            n = _glyphUses.get(k, 0) + 1
+            if n < GLYPH_CACHE_AFTER:
+                if len(_glyphUses) > 20000:
+                    _glyphUses.clear()
+                _glyphUses[k] = n
+                ready = False
+                continue
+            _glyphUses.pop(k, None)
+            try:
+                textImage(face, dsize, ch, fx, fy, fill)
+            except Exception:
+                _textCache[k] = None
+        if _textCache[k] is None:
+            return False  # read-back failed for this glyph
+    if not ready:
+        return False
+    ctx.save()
+    ctx.new_path()
+    toDevice(ctx)
+    draw = ctx.draw_image
+    for dx, ch in plan:
+        img, mox, moy = _textCache[(face, dsize, ch, fx, fy, fill)]
+        draw(img, ix + dx - mox, iy - moy, 1.0)
+    ctx.restore()
+    return True
+
+
+def drawLabelFast(ctx, text, x, y, face, size, fill, border, bw, rot, cx, cy, ax, xattr):
+    if (border is None or not bw) and not rot:
+        if stampText(ctx, text, x, y, face, size, fill, ax, xattr):
             return
+    if S.face != face:
+        # Selected outside save/restore so it stays for the next label (it's slow);
+        # restore() would undo it. rebuild() resets S.face each frame.
+        ctx.select_font_face(*face)
+        S.face = face
+    ctx.save()
+    ctx.new_path()
     if rot:
         rotateAbout(ctx, rot, cx, cy)
-    ctx.select_font_face(*face)
     ctx.set_font_size(size)
     ctx.move_to(x, y)
+    ctx.text_path(text)
+    ctx.set_source_rgba(*fill)
+    ctx.fill_preserve()
     if border is not None and bw:
-        ctx.text_path(text)
-        ctx.fill_preserve()
         ctx.set_source_rgba(*border)
         ctx.set_line_width(bw)
         ctx.stroke()
-    else:
-        ctx.show_text(text)
     ctx.new_path()
     ctx.restore()
 
@@ -563,84 +887,119 @@ class PixelLRU(object):
 _scaledCache = PixelLRU(24_000_000)  # ~96 MB of resized images
 
 
-def scaledImage(key, surf, w, h):
+def scaledImage(key, img, w, h):
     """The image resampled once to w x h pixels, so each frame is a plain copy."""
     w = max(1, int(round(w)))
     h = max(1, int(round(h)))
-    if w == surf.get_width() and h == surf.get_height():
-        return surf
+    if w == img.width and h == img.height:
+        return img
     k = (key, w, h)
     hit = _scaledCache.get(k)
     if hit is not None:
         return hit[0]
-    s = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
-    c = cairo.Context(s)
-    c.scale(w / surf.get_width(), h / surf.get_height())
-    c.set_source_surface(surf, 0, 0)
-    c.paint()
-    s.flush()
+    s = img.scaled(w, h)
     _scaledCache.put(k, s, w * h)
     return s
 
 
-_rotatedCache = PixelLRU(12_000_000)  # ~48 MB of rotated sprites
+# CMU_APPROX: a rotated image is drawn from a copy rotated to the nearest ROT_STEP
+# degrees and placed on whole pixels (a plain copy instead of a resampling). The
+# copies are made with PIL from one read-back of the unrotated image; without PIL,
+# images are rotated while drawing as usual.
+ROT_STEP = 2
+_rotBase = {}  # (key, width, height) -> the image as a PIL 'RGBa' image, or None
 
 
-def rotatedImage(surf, deg):
-    """surf rotated by a whole number of degrees, rendered once.
-    Returns (surface, half width, half height) of its bounding box."""
-    k = (surf, deg)
-    hit = _rotatedCache.get(k)
+def _readOver(img, black):
+    """img's pixels drawn over an opaque black or white background."""
+    c = wyvern.ImageSurface(img.width, img.height).canvas  # starts opaque white
+    if black:
+        c.new_path()
+        c.rectangle(0, 0, img.width, img.height)
+        c.set_source_rgba(0, 0, 0, 1)
+        c.fill()
+    c.draw_image(img, 0, 0, 1.0)
+    w, h, bpp, px = readPixels(c)
+    if (w, h) != (img.width, img.height) or bpp < 3:
+        raise ValueError('unexpected read-back')
+    return bpp, px
+
+
+def rotationBase(key, img):
+    k = (key, img.width, img.height)
+    if k in _rotBase:
+        return _rotBase[k]
+    base = None
+    try:
+        from PIL import Image, ImageChops
+        size = (img.width, img.height)
+        # Over black each channel is colour * alpha (premultiplied); over white it's
+        # that + (1 - alpha), so alpha = 1 - (white - black).
+        bpp, onBlack = _readOver(img, True)
+        _, onWhite = _readOver(img, False)
+
+        def chan(px, c):
+            return Image.frombytes('L', size, bytes(px[c::bpp]))
+
+        a = ImageChops.invert(ImageChops.subtract(chan(onWhite, 1), chan(onBlack, 1)))
+        # A premultiplied channel can't exceed alpha.
+        rgb = [ImageChops.darker(chan(onBlack, c), a) for c in range(3)]
+        base = Image.merge('RGBa', rgb + [a])
+    except Exception:
+        pass  # no PIL or no read-back: rotate while drawing
+    if len(_rotBase) > 200:
+        _rotBase.clear()
+    _rotBase[k] = base
+    return base
+
+
+def rotatedImage(key, img, deg):
+    """img rotated by deg (rounded to ROT_STEP) about its centre, on a transparent
+    image with the same centre, or None."""
+    q = round(deg / ROT_STEP) * ROT_STEP % 360
+    k = ('rot', key, img.width, img.height, q)
+    hit = _scaledCache.get(k)
     if hit is not None:
         return hit[0]
-    w, h = surf.get_width(), surf.get_height()
-    c, s = abs(math.cos(deg * DEG)), abs(math.sin(deg * DEG))
-    bw, bh = int(math.ceil(w * c + h * s)) + 2, int(math.ceil(w * s + h * c)) + 2
-    out = cairo.ImageSurface(cairo.FORMAT_ARGB32, bw, bh)
-    ctx = cairo.Context(out)
-    ctx.translate(bw / 2, bh / 2)
-    ctx.rotate(deg * DEG)
-    ctx.set_source_surface(surf, -w / 2, -h / 2)
-    ctx.rectangle(-w / 2, -h / 2, w, h)
-    ctx.fill()
-    out.flush()
-    r = (out, bw / 2, bh / 2)
-    _rotatedCache.put(k, r, bw * bh)
+    base = rotationBase(key, img)
+    if base is None:
+        return None
+    from PIL import Image
+    # Canvas rotation is clockwise on screen, PIL's counter-clockwise. Bilinear like
+    # wyvern's own filtering (bicubic could overshoot alpha).
+    im = base.rotate(-q, resample=Image.BILINEAR, expand=True)
+    r = wyvern.WyvernImage(bytearray(im.tobytes()), im.width, im.height, im.width * 4)
+    _scaledCache.put(k, r, im.width * im.height)
     return r
 
 
 def drawImageFast(ctx, key, src, left, top, w, h, alpha, rot):
+    # Work in device pixels with an image pre-scaled to its on-screen size.
+    d, ox, oy = S.dev
+    img = scaledImage(key, src, w * d, h * d)
+    if rot and APPROX:
+        r = rotatedImage(key, img, rot)
+        if r:
+            ctx.save()
+            ctx.new_path()
+            toDevice(ctx)
+            cx = (left + w / 2) * d + ox
+            cy = (top + h / 2) * d + oy
+            ctx.draw_image(r, round(cx - r.width / 2), round(cy - r.height / 2), alpha)
+            ctx.restore()
+            return
     ctx.save()
     ctx.new_path()
-    m = ctx.get_matrix()
-    if m.xy == 0 and m.yx == 0:
-        # Work in device pixels with an image pre-scaled to its on-screen size.
-        surf = scaledImage(key, src, w * m.xx, h * m.yy)
-        ctx.identity_matrix()
-        deg = round(rot) % 360
-        if deg:
-            # Sprite pre-rotated to the nearest degree: drawing is a plain copy.
-            surf, hw, hh = rotatedImage(surf, deg)
-            x = round((left + w / 2) * m.xx + m.x0 - hw)
-            y = round((top + h / 2) * m.yy + m.y0 - hh)
-        else:
-            # Whole-pixel placement keeps pixman on its unfiltered copy path.
-            x, y = round(left * m.xx + m.x0), round(top * m.yy + m.y0)
-        sw, sh = surf.get_width(), surf.get_height()
-    else:
-        if rot:
-            rotateAbout(ctx, rot, left + w / 2, top + h / 2)
+    if rot:
+        rotateAbout(ctx, rot, left + w / 2, top + h / 2)
         ctx.translate(left, top)
-        ctx.scale(w / src.get_width(), h / src.get_height())
-        surf, x, y = src, 0, 0
-        sw, sh = src.get_width(), src.get_height()
-    ctx.set_source_surface(surf, x, y)
-    ctx.rectangle(x, y, sw, sh)
-    if alpha >= 1:
-        ctx.fill()
+        if d != 1:
+            ctx.transform(1 / d, 0, 0, 1 / d, 0, 0)
+        ctx.draw_image(img, 0, 0, alpha)
     else:
-        ctx.clip()
-        ctx.paint_with_alpha(alpha)
+        toDevice(ctx)
+        # Whole-pixel placement: no filtering, a plain copy.
+        ctx.draw_image(img, round(left * d + ox), round(top * d + oy), alpha)
     ctx.restore()
 
 
@@ -801,6 +1160,10 @@ def buildArc(args, kw):
     return FastShape(drawArcFast, (cx, cy, w / 2, h / 2, start, sweep, fill, border, bw, dash, rot))
 
 
+def _noop(ctx):
+    pass
+
+
 def buildLine(args, kw):
     if len(args) != 4:
         return FAIL
@@ -815,7 +1178,7 @@ def buildLine(args, kw):
     if not _num(lw) or lw <= 0:
         return FAIL
     if fill is None:
-        return FastShape(lambda ctx: None, ())
+        return FastShape(_noop, ())
     return FastShape(drawLineFast, (x1, y1, x2, y2, fill, lw, dash, rot))
 
 
@@ -873,7 +1236,7 @@ def buildImage(args, kw):
         return FAIL  # the original call raises the proper error
     key = sl.hashReference(url)
     src = sl.activeDrawing.images[key]
-    w, h = kw.get('width', src.get_width()), kw.get('height', src.get_height())
+    w, h = kw.get('width', src.width), kw.get('height', src.height)
     if not (_num(w) and _num(h)) or w <= 0 or h <= 0:
         return FAIL
     left, top = alignLeftTop(s[3], x, y, w, h)
@@ -892,6 +1255,9 @@ def flushSlowShapes(ctx):
         shapes = g._shapes
         g._shapes = []
         ctx.save()
+        # Start from the clean source state the stock drawing has (the fast paths
+        # set colours without save/restore).
+        ctx.set_source_rgba(0, 0, 0, 1)
         try:
             for shape in shapes:
                 shape.draw(ctx)
@@ -899,8 +1265,39 @@ def flushSlowShapes(ctx):
             ctx.restore()
 
 
-def drawNow(ctx, builder, slowFn, args, kwargs):
-    item = builder(args, kwargs)
+# Built shapes, keyed by the call's signature (function, args, kwargs), so a call
+# identical to a recent one (a tile map, a star field, a HUD box) skips argument
+# checking and geometry. Two generations: when the new one fills up it becomes the
+# old one, and old entries that are used again move back to the new one.
+MEMO_SIZE = 4096
+_memoNew = {}
+_memoOld = {}
+
+
+def memoMiss(key, builder, args, kwargs):
+    global _memoNew, _memoOld
+    item = _memoOld.get(key)
+    if item is None:
+        item = builder(args, kwargs)
+    if len(_memoNew) >= MEMO_SIZE:
+        _memoOld = _memoNew
+        _memoNew = {}
+    _memoNew[key] = item
+    return item
+
+
+def clearMemo():
+    _memoNew.clear()
+    _memoOld.clear()
+
+
+def drawNow(ctx, key, builder, slowFn, args, kwargs):
+    if key is None:
+        item = builder(args, kwargs)  # unhashable arguments
+    else:
+        item = _memoNew.get(key)
+        if item is None:
+            item = memoMiss(key, builder, args, kwargs)
     if item is not FAIL:
         item.fn(ctx, *item.args)  # immediate mode: straight into the frame
         return None
@@ -916,27 +1313,56 @@ class StaticPrefix(object):
     calls equal last frame's, they aren't drawn; once the matching run reaches the
     cached length, a bitmap of that prefix is pasted instead. A mismatch inside the
     run replays the skipped calls first, so output is always exact. The bitmap is
-    re-captured whenever the static run gets shorter or longer."""
+    re-captured whenever the static run gets shorter or longer; captures are a PNG
+    round trip, so if they keep getting replaced quickly, capturing backs off.
+
+    Pasting a full frame isn't free (a 2-3x larger cost than filling the screen), so
+    the time from the start of the frame to the end of the paste is compared with
+    the time the same calls took to draw. If pasting keeps losing, the layer stops
+    capturing for a while (a cheap tile grid is faster to just draw)."""
 
     SKIP, EXTEND, NORMAL = 0, 1, 2
     MIN_CALLS = 16  # shorter static runs aren't worth a full-frame copy
+    SHORT_LIFE = 30  # frames: a snapshot replaced sooner than this was wasted
+    MAX_BACKOFF = 1800
+    SLOW_PASTES = 3  # this many pastes in a row slower than PASTE_RATIO x drawing...
+    PASTE_RATIO = 0.8
+    SLOW_BLOCK = 600  # ...and capturing stops for this many frames
 
     def __init__(self):
         self.on = os.environ.get('CMU_STATIC_LAYER', '1') != '0'
+        self.frame = 0
+        self.backoff = 0
+        self.blockedUntil = 0
+        self.slowPastes = 0
+        self.drawCost = 0.0
+        self.t0 = 0.0
+        self.active = False  # tracking this frame's calls (see begin)
         self.reset()
 
     def reset(self):
         self.prev = []
         self.length = 0
         self.snap = None
+        self.snapFrame = None
         self.key = None
+        self.active = False
 
     def begin(self, ctx, key, paintBg):
         """Returns True if the caller must paint the background now."""
+        self.frame += 1
         if key != self.key:
             self.reset()
             self.key = key
         self.ctx = ctx
+        if self.snap is None and self.frame < self.blockedUntil:
+            # Capturing is blocked, so there's nothing to skip: don't even track
+            # the calls (step() costs a little per call). Tracking restarts after.
+            self.active = False
+            self.prev = []
+            return True
+        self.active = True
+        self.t0 = time.perf_counter()
         self.cur = []
         self.pending = []
         self.paintBg = paintBg
@@ -944,28 +1370,43 @@ class StaticPrefix(object):
         return self.mode != self.SKIP  # the pasted bitmap already holds the background
 
     def capture(self, n):
-        if n < self.MIN_CALLS:
-            self.snap, self.length = None, 0
+        cost = time.perf_counter() - self.t0  # drawing calls 0..n-1 this frame
+        f = self.frame
+        if self.snapFrame is not None:
+            if f - self.snapFrame < self.SHORT_LIFE:
+                self.backoff = min(max(self.backoff * 2, self.SHORT_LIFE), self.MAX_BACKOFF)
+                self.blockedUntil = f + self.backoff
+            else:
+                self.backoff = 0
+        self.snap, self.length, self.snapFrame = None, 0, None
+        if n < self.MIN_CALLS or f < self.blockedUntil:
             return
-        src = self.ctx.get_target()
-        src.flush()
-        if self.snap is None:
-            self.snap = cairo.ImageSurface(cairo.FORMAT_ARGB32, src.get_width(), src.get_height())
-        c = cairo.Context(self.snap)
-        c.set_operator(cairo.OPERATOR_SOURCE)
-        c.set_source_surface(src, 0, 0)
-        c.paint()
+        try:
+            self.snap = snapshot(self.ctx)  # the frame so far is exactly calls 0..n-1
+        except Exception:
+            self.on = False  # no read-back on this system: just draw everything
+            return
         self.length = n
+        self.snapFrame = f
+        self.drawCost = cost
+        self.slowPastes = 0
 
     def paste(self):
         ctx = self.ctx
         ctx.save()
-        ctx.identity_matrix()
-        ctx.reset_clip()
-        ctx.set_operator(cairo.OPERATOR_SOURCE)
-        ctx.set_source_surface(self.snap, 0, 0)
-        ctx.paint()
+        toDevice(ctx)
+        ctx.draw_image(self.snap, 0, 0, 1.0)
         ctx.restore()
+        if time.perf_counter() - self.t0 < self.PASTE_RATIO * self.drawCost:
+            self.slowPastes = 0
+            return
+        self.slowPastes += 1
+        if self.slowPastes >= self.SLOW_PASTES:
+            # Drawing is cheaper: drop the snapshot (this frame is already complete
+            # up to here) and don't capture again for a while.
+            self.slowPastes = 0
+            self.snap, self.length, self.snapFrame = None, 0, None
+            self.blockedUntil = self.frame + self.SLOW_BLOCK
 
     def replayPending(self):
         self.paintBg()
@@ -974,20 +1415,16 @@ class StaticPrefix(object):
             drawNow(self.ctx, *call)
 
     def step(self, sig, builder, slowFn, args, kwargs):
-        """True if the call was absorbed (skipped), False if the caller must draw it."""
+        """True if the call was absorbed (skipped), False if the caller must draw it.
+        sig is None for a call with unhashable arguments (it never matches)."""
         i = len(self.cur)
         prev = self.prev
-        # prev[i] was hash-checked last frame, so an equal sig holds no mutable values.
-        same = i < len(prev) and prev[i] is not None and sig == prev[i]
-        if not same:
-            try:
-                hash(sig)  # unhashable (e.g. a list argument) = can't prove unchanged
-            except TypeError:
-                sig = None
+        # sig is hashable, so an equal one holds no mutable values.
+        same = sig is not None and i < len(prev) and sig == prev[i]
         self.cur.append(sig)
         if self.mode == self.SKIP:
             if same and i < self.length:
-                self.pending.append((builder, slowFn, args, kwargs))
+                self.pending.append((sig, builder, slowFn, args, kwargs))
                 if i + 1 == self.length:
                     self.pending = []
                     self.paste()
@@ -1001,11 +1438,15 @@ class StaticPrefix(object):
             if same:
                 return False
             if i != self.length:
-                self.capture(i)  # the frame so far is exactly calls 0..i-1
+                self.capture(i)
             self.mode = self.NORMAL
         return False
 
     def end(self):
+        if not self.active:
+            self.ctx = None
+            return
+        self.active = False
         n = len(self.cur)
         if self.mode == self.SKIP:  # frame ended inside the cached run
             self.replayPending()
@@ -1017,16 +1458,38 @@ class StaticPrefix(object):
 
 
 def makeFastDrawFn(builder, slowFn):
+    isLabel = builder is buildLabel
+
     def drawFn(*args, **kwargs):
         ctx = S.ctx  # set only while the user's redrawAll runs in CPCS mode
         if ctx is None:
             return slowFn(*args, **kwargs)
+        # The signature of the call. A label's text is in it too: 1 == 1.0 == True,
+        # but they're drawn as '1', '1.0' and 'True'.
+        if kwargs:
+            key = (builder, args, tuple(kwargs.items()))
+        else:
+            key = (builder, args)
+        if isLabel and args:
+            key = key + (str(args[0]),)
+        try:
+            item = _memoNew.get(key)
+        except TypeError:  # unhashable (e.g. a list argument): no memo, never static
+            key = item = None
         layer = S.layer
-        if layer.on:
-            sig = (builder, args, tuple(kwargs.items()))
-            if layer.step(sig, builder, slowFn, args, kwargs):
-                return None
-        return drawNow(ctx, builder, slowFn, args, kwargs)
+        if layer.active and layer.step(key, builder, slowFn, args, kwargs):
+            return None
+        if item is None:
+            if key is None:
+                item = builder(args, kwargs)
+            else:
+                item = memoMiss(key, builder, args, kwargs)
+        if item is not FAIL:
+            item.fn(ctx, *item.args)  # immediate mode: straight into the frame
+            return None
+        result = slowFn(*args, **kwargs)
+        flushSlowShapes(ctx)
+        return result
 
     drawFn.__name__ = slowFn.__name__
     drawFn.__doc__ = slowFn.__doc__
@@ -1039,25 +1502,27 @@ def makeFastDrawFn(builder, slowFn):
 class State(object):
     dirty = True
     lastRender = 0.0
-    cairoSurface = None
-    pgSurface = None
+    stepped = False  # a step event came since the last rendered frame
+    surface = None  # wyvern surface of the latest event
+    win = None  # window size (logical units) from the latest 'resize' event
     fit = False
-    joy = False
-    offset = (0, 0)
-    frameSize = None
-    antialias = None
-    ctx = None  # cairo context while the user's redrawAll is drawing
+    fitView = None  # (scale, x offset, y offset) of the app in the window (CMU_FIT)
+    clearWindow = True  # CMU_FIT: the letterbox needs painting
+    ctx = None  # wyvern canvas while the user's redrawAll is drawing
+    face = None  # font selected on ctx at the redrawAll level (see drawLabelFast)
+    language = None  # cmu_graphics language the memoized shapes were built in
+    dev = (1.0, 0.0, 0.0)  # app units -> device pixels: (scale, x offset, y offset)
     layer = None
-    scale = 1.0
-    cursorOn = False  # a mouse moved: draw our own cursor (KMSDRM shows none)
-    cursorPos = (0, 0)  # screen pixels, from the latest mouse event
-    lastCursor = None
+    inspectorShown = False
+    mvcEvery = 1  # CMU_MVC_CHECK: run the MVC checker on 1 frame in N (0 = never)
+    mvcFrame = 0
+    stopSnap = None  # the frame (with the error screen) once the app has stopped
 
 
 S = State()
 _origRedrawAllWrapper = cg.App.redrawAllWrapper
 _origRedrawAll = cg.App.redrawAll
-_origUpdateScreen = cg.App.updateScreen
+_origOnEvent = cg.App.on_event
 
 
 def redrawAllWrapper(self):
@@ -1077,8 +1542,45 @@ def paintBackground(self, ctx):
         )
         shape.draw(ctx)
     else:
+        ctx.new_path()
+        ctx.rectangle(0, 0, self.width, self.height)
         ctx.set_source_rgba(*c)
-        ctx.paint()
+        ctx.fill()
+
+
+def setupView(self, ctx):
+    """Work out S.dev and, with CMU_FIT, put the app's transform on ctx."""
+    surface = S.surface
+    win = S.win
+    if win is None or not win[0]:
+        win = (self.width, self.height)
+    # HiDPI: the surface is in device pixels, the window size in logical units.
+    sf = surface.width / win[0] if surface is not None and win[0] else 1.0
+    if not S.fit:
+        S.dev = (sf, 0.0, 0.0)
+        return
+    s = min(win[0] / self.width, win[1] / self.height)
+    ox = (win[0] - self.width * s) / 2
+    oy = (win[1] - self.height * s) / 2
+    if S.clearWindow:
+        S.clearWindow = False
+        ctx.new_path()
+        ctx.rectangle(-1, -1, win[0] + 2, win[1] + 2)
+        ctx.set_source_rgba(0, 0, 0, 1)
+        ctx.fill()
+    S.fitView = (s, ox, oy)
+    ctx.transform(s, 0, 0, s, ox, oy)
+    S.dev = (sf * s, sf * ox, sf * oy)
+
+
+def renderFailed(self, ctx):
+    """What _safeMethod does, without ending the event loop: report, stop, and draw
+    the error screen over what was drawn so far."""
+    sys.excepthook(*sys.exc_info())
+    self.stop()
+    if self._running:
+        self.drawErrorScreen()
+    flushSlowShapes(ctx)
 
 
 def rebuild(self, ctx):
@@ -1087,316 +1589,155 @@ def rebuild(self, ctx):
     layer = S.layer
     if layer.on:
         bg = self.background
-        if layer.begin(ctx, (id(self._cairo_surface), bg if bg is None or type(bg) is str else id(bg)),
-                       lambda: paintBackground(self, ctx)):
+        key = (id(S.surface), S.surface and S.surface.width, S.surface and S.surface.height, S.dev,
+               bg if bg is None or type(bg) is str else id(bg))
+        if layer.begin(ctx, key, lambda: paintBackground(self, ctx)):
             paintBackground(self, ctx)
     else:
         paintBackground(self, ctx)
     ctx.save()
+    if sl.cmuGraphicsLanguage != S.language:  # colour and align names are translated
+        S.language = sl.cmuGraphicsLanguage
+        clearMemo()
     S.ctx = ctx
+    S.face = None
+    every = S.mvcEvery
+    skipCheck = False
+    if every != 1 and not self._disableMvcChecker:
+        S.mvcFrame += 1
+        skipCheck = every == 0 or S.mvcFrame % every != 0
     try:
-        _origRedrawAllWrapper(self)
+        if skipCheck:
+            # Only for this frame: the game's own disableMvcChecker setting is untouched.
+            self._disableMvcChecker = True
+            try:
+                _origRedrawAllWrapper(self)
+            finally:
+                self._disableMvcChecker = False
+        else:
+            _origRedrawAllWrapper(self)
         flushSlowShapes(ctx)
         if layer.on:
             layer.end()
     except Exception:
+        S.ctx = None
         self.inRedrawAll = False
-        tlg = self._tlg._shape
-        tlg._shapes = []
         layer.reset()
-        raise
+        renderFailed(self, ctx)
     finally:
         S.ctx = None
+        S.face = None
         ctx.restore()
         ctx.new_path()
 
 
-def updateScreen(self, newScreen):
-    if not S.fit:
-        _origUpdateScreen(self, newScreen)
-        if S.antialias is not None:
-            self._ctx.set_antialias(S.antialias)
+def drawInspector(self, ctx):
+    ctx.save()
+    try:
+        self.inspector.draw(ctx)
+    finally:
+        ctx.restore()
+
+
+def drawStopped(self, ctx, inspector):
+    """After an error: keep the last frame with the error screen over it."""
+    if S.stopSnap is None:
+        flushSlowShapes(ctx)  # the error screen's shapes
+        try:
+            ctx.save()
+            ctx.new_path()
+            # snapshot takes the whole surface in device pixels; nothing to undo here
+            S.stopSnap = snapshot(ctx)
+        except Exception:
+            S.stopSnap = False
+        finally:
+            ctx.restore()
+    elif S.stopSnap and (inspector or S.inspectorShown):
+        ctx.save()
+        toDevice(ctx)
+        ctx.draw_image(S.stopSnap, 0, 0, 1.0)
+        ctx.restore()
+    if inspector:
+        drawInspector(self, ctx)
+
+
+def redrawAll(self, ctx):
+    if not self._isMvc:
+        # Shape-object mode (cmu_graphics.run()): the stock drawing, scaled if CMU_FIT.
+        ctx.save()
+        try:
+            setupView(self, ctx)
+            _origRedrawAll(self, ctx)
+        finally:
+            ctx.restore()
         return
-    # Fill the display, keep the aspect ratio, and render straight at that size.
-    dw, dh = pygame.display.get_desktop_sizes()[0]
-    s = min(dw / self.width, dh / self.height)
-    fw, fh = max(1, int(round(self.width * s))), max(1, int(round(self.height * s)))
-    if newScreen or self._screen is None:
-        self._screen = pygame.display.set_mode((dw, dh))
-        self._screen.fill((0, 0, 0))
-    S.offset = ((dw - fw) // 2, (dh - fh) // 2)
-    S.frameSize = (fw, fh)
-    S.scale = s
-    pygame.mouse.set_visible(False)
-    self._cairo_surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, fw, fh)
-    self._ctx = cairo.Context(self._cairo_surface)
-    self._ctx.scale(s, s)
-    if S.antialias is not None:
-        self._ctx.set_antialias(S.antialias)
-
-
-CURSOR = ((0, 0), (0, 17), (4, 13), (7, 20), (10, 19), (7, 12), (12, 12))
-
-
-def present(screen):
-    """Put the current frame (and the cursor, if a mouse is in use) on screen."""
-    screen.blit(S.pgSurface, S.offset if S.fit else (0, 0))
-    if S.cursorOn:
-        x, y = S.cursorPos
-        pts = [(x + px, y + py) for px, py in CURSOR]
-        pygame.draw.polygon(screen, (255, 255, 255), pts)
-        pygame.draw.polygon(screen, (0, 0, 0), pts, 1)
-        S.lastCursor = (x, y)
-    pygame.display.flip()
-
-
-def cursorMoved():
-    return S.cursorOn and S.cursorPos != S.lastCursor
-
-
-def redrawAll(self, screen, cairo_surface, ctx):
     inspector = self.shouldDrawInspector()
-    ownSurface = cairo_surface is self._cairo_surface
-    if self._isMvc and ownSurface:
-        if inspector or S.cairoSurface is not cairo_surface:
-            S.dirty = True  # no display list to replay: rebuild the frame
-        elif not S.dirty:
-            if cursorMoved():
-                present(screen)  # only the cursor moved
-            return  # nothing changed since the last frame
+    ctx.save()
+    try:
+        setupView(self, ctx)
+        if self.stopped:
+            drawStopped(self, ctx, inspector)
+            S.inspectorShown = inspector
+            return
+        if inspector or S.inspectorShown:
+            S.dirty = True  # no display list to redraw the inspector over: rebuild
+        if not S.dirty:
+            return  # nothing changed: the window keeps the last frame
         now = time.perf_counter()
         sps = self.stepsPerSecond
-        if (
-            S.cairoSurface is cairo_surface
-            and not (self.paused or self.stopped)
-            and sps >= 10
-            and now - S.lastRender < 0.5 / sps
-        ):
-            if cursorMoved():
-                present(screen)
+        if not S.stepped and not self.paused and sps >= 10 and now - S.lastRender < 0.5 / sps:
             return  # event-only redraw right after a frame: the next step draws it
         S.lastRender = now
-        if self.stopped:
-            return  # keep the last frame; the error screen draws itself
+        S.stepped = False
         rebuild(self, ctx)
-    else:
-        # Shape-object mode, or drawErrorScreen's own app-sized surface.
-        if S.fit and not ownSurface:
-            sc = S.frameSize[0] / self.width
-            ctx.scale(sc, sc)
-        paintBackground(self, ctx)
-        ctx.save()
-        try:
-            self._tlg._shape.draw(ctx)
-        finally:
-            ctx.restore()
-
-    if inspector:
-        ctx.save()
-        try:
-            self.inspector.draw(ctx)
-        finally:
-            ctx.restore()
-
-    if S.cairoSurface is not cairo_surface:
-        # Opaque view of the cairo buffer; shares memory, so build it once per surface.
-        S.pgSurface = pygame.image.frombuffer(
-            cairo_surface.get_data(), (cairo_surface.get_width(), cairo_surface.get_height()), 'RGBX'
-        )
-        S.cairoSurface = cairo_surface
-    cairo_surface.flush()
-    present(screen)
-    self.frameworkRedrew = True
+        if inspector:
+            drawInspector(self, ctx)
+        S.inspectorShown = inspector
+    finally:
+        ctx.restore()
+        self.frameworkRedrew = True
 
 
-# ---------------------------------------------------------------- R36S gamepad
-
-# R36S "GO-Super Gamepad" raw button -> CMU arcade box button number.
-# a/b/x/y, L1 (coin) and R1 (P1) already match; Select/Start move to 8/9 like the
-# arcade box; console-only buttons take the numbers left free.
-R36S_BUTTONS = {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7, 12: 8, 13: 9, 14: 10, 15: 11}
-R36S_DPAD = {8: (1, -1), 9: (1, 1), 10: (0, -1), 11: (0, 1)}  # raw button -> (axis, direction)
-R36S_SELECT, R36S_START = 12, 13
+class _Mouse(object):
+    __slots__ = ('x', 'y', 'button', 'buttons')
 
 
-class Pad(object):
-    held = set()
+class _MouseEvent(object):
+    __slots__ = ('event_type', 'mouse')
 
 
-def translateEvents(events):
-    """R36S gamepad events -> arcade box events. The D-pad becomes the arcade
-    joystick (digital axes 0/1, like the left stick); Select+Start quits."""
-    out = []
-    for e in events:
-        et = e.type
-        if et == pygame.JOYBUTTONDOWN or et == pygame.JOYBUTTONUP:
-            b = e.button
-            down = et == pygame.JOYBUTTONDOWN
-            if down:
-                Pad.held.add(b)
-            else:
-                Pad.held.discard(b)
-            if R36S_SELECT in Pad.held and R36S_START in Pad.held:
-                out.append(pygame.event.Event(pygame.QUIT))
-                continue
-            if b in R36S_DPAD:
-                axis = R36S_DPAD[b][0]
-                neg = 10 if axis == 0 else 8
-                pos = 11 if axis == 0 else 9
-                value = float((pos in Pad.held) - (neg in Pad.held))
-                out.append(pygame.event.Event(
-                    pygame.JOYAXISMOTION, joy=getattr(e, 'joy', 0), instance_id=e.instance_id,
-                    axis=axis, value=value))
-                continue
-            if b in R36S_BUTTONS:
-                out.append(pygame.event.Event(
-                    et, joy=getattr(e, 'joy', 0), instance_id=e.instance_id, button=R36S_BUTTONS[b]))
-                continue
-        out.append(e)
-    return out
+def _fitMouse(self, event):
+    """Window coordinates -> app coordinates when the app is scaled to fit."""
+    s, ox, oy = S.fitView
+    m = event.mouse
+    mm = _Mouse()
+    mm.x = int(min(max((m.x - ox) / s, 0), self.width - 1))
+    mm.y = int(min(max((m.y - oy) / s, 0), self.height - 1))
+    mm.button = getattr(m, 'button', None)
+    mm.buttons = getattr(m, 'buttons', None)
+    e = _MouseEvent()
+    e.event_type = event.event_type
+    e.mouse = mm
+    return e
 
 
-_MOUSE_EVENTS = (pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP)
+_MOUSE_EVENTS = frozenset(['mouse_move', 'mouse_drag', 'mouse_press', 'mouse_release'])
 
 
-def mapMouse(events):
-    """Screen pixels -> app coordinates when the app is scaled to fit."""
-    out = []
-    app = object.__getattribute__(cg.app, '_app')
-    for e in events:
-        if e.type in _MOUSE_EVENTS:
-            S.cursorOn = True
-            x, y = e.pos
-            S.cursorPos = (int(x), int(y))
-            ax = min(max((x - S.offset[0]) / S.scale, 0), app.width - 1)
-            ay = min(max((y - S.offset[1]) / S.scale, 0), app.height - 1)
-            d = dict(e.dict, pos=(int(ax), int(ay)))
-            if 'rel' in d:
-                d['rel'] = (int(d['rel'][0] / S.scale), int(d['rel'][1] / S.scale))
-            e = pygame.event.Event(e.type, d)
-        out.append(e)
-    return out
-
-
-_origEventGet = pygame.event.get
-
-
-def eventGet(*args, **kwargs):
-    events = _origEventGet(*args, **kwargs)
-    if S.joy:
-        events = translateEvents(events)
-    if S.fit:
-        events = mapMouse(events)
-    return events
-
-
-# ---------------------------------------------------------------- sound
-
-STREAM_BYTES = 1_000_000  # bigger files (music) stream through pygame.mixer.music
-_decoded = {}
-_music = {'owner': None, 'paused': False}
-
-
-def soundInit(self, url):
-    """cmu_graphics.Sound, minus decoding everything up front."""
-    if not pygame.mixer.get_init():
-        pygame.mixer.init()
-        pygame.mixer.set_num_channels(1)
-    if not isinstance(url, str):
-        raise Exception(f'TypeError: Sound.url should be string (but {url!r} is of type {type(url).__name__})')
-    cg.Sound.number_of_sounds += 1
-    if pygame.mixer.get_num_channels() == cg.Sound.number_of_sounds:
-        pygame.mixer.set_num_channels(cg.Sound.number_of_sounds * 2)
-    if url.startswith('file://'):
-        url = url.split('//')[-1]
-    if url.startswith('http'):
-        self._src = url
-        self._stream = False
-    else:
-        main = __import__('__main__')
-        base = os.path.join(main.__file__, '..') if hasattr(main, '__file__') else os.getcwd()
-        self._src = os.path.abspath(os.path.join(base, url))
-        self._stream = os.path.getsize(self._src) > STREAM_BYTES
-    self._sound = None
-    self._volume = 1.0
-    self.channel = None
-
-
-def soundData(self):
-    if self._sound is None:
-        k = self._src
-        if k not in _decoded:
-            if k.startswith('http'):
-                import io
-                _decoded[k] = pygame.mixer.Sound(io.BytesIO(cg.webrequest.get(k).read()))
-            else:
-                _decoded[k] = pygame.mixer.Sound(k)
-        self._sound = _decoded[k]
-    return self._sound
-
-
-def soundPlay(self, loop=False, restart=False, **kwargs):
-    for k in kwargs:
-        en = toEnglish(k, 'shape-attr')
-        if en == 'loop':
-            loop = kwargs[k]
-        elif en == 'restart':
-            restart = kwargs[k]
-        else:
-            raise Exception(f"TypeError: Sound.play() got an unexpected keyword argument '{k}'")
-    if not isinstance(loop, bool) or not isinstance(restart, bool):
-        raise Exception('The loop and restart arguments to Sound.play must be True or False')
-    loops = -1 if loop else 0
-    if self._stream:
-        music = pygame.mixer.music
-        if _music['owner'] is self and _music['paused'] and not restart:
-            music.unpause()
-        elif _music['owner'] is not self or restart or not music.get_busy():
-            music.load(self._src)
-            music.set_volume(self._volume)
-            music.play(loops=loops)
-            _music['owner'] = self
-        _music['paused'] = False
-        return
-    snd = soundData(self)
-    if not self.channel or not self.channel.get_busy():
-        self.channel = snd.play(loops=loops)
-    elif restart:
-        self.channel.stop()
-        self.channel = snd.play(loops=loops)
-    else:
-        self.channel.unpause()
-
-
-def soundPause(self):
-    if self._stream:
-        if _music['owner'] is self:
-            pygame.mixer.music.pause()
-            _music['paused'] = True
-    elif self.channel:
-        self.channel.pause()
-
-
-def soundSetVolume(self, volume):
-    self._volume = volume
-    if self._stream:
-        if _music['owner'] is self:
-            pygame.mixer.music.set_volume(volume)
-    else:
-        soundData(self).set_volume(volume)
-
-
-def soundGetVolume(self):
-    return self._volume if self._stream else soundData(self).get_volume()
-
-
-def installSound():
-    cg.Sound.__init__ = soundInit
-    cg.Sound.sound = property(soundData)
-    cg.Sound.play = soundPlay
-    cg.Sound.pause = soundPause
-    cg.Sound.setVolume = soundSetVolume
-    cg.Sound.getVolume = soundGetVolume
+def onEvent(self, event, surface):
+    S.surface = surface
+    et = event.event_type
+    if et == 'step':
+        S.stepped = True  # the redraw that follows a step is never put off
+    elif et == 'resize':
+        S.win = (event.resize.width, event.resize.height)
+        S.clearWindow = True
+        S.dirty = True
+        if S.fit:
+            return  # the app keeps its size; the next redraw rescales it
+    elif S.fit and et in _MOUSE_EVENTS and S.fitView is not None:
+        event = _fitMouse(self, event)
+    _origOnEvent(self, event, surface)
 
 
 # ---------------------------------------------------------------- install
@@ -1415,40 +1756,60 @@ _BUILDERS = {
 }
 
 
-def install(pkgGlobals):
+def _replaceEverywhere(swaps):
+    """Swap original functions for the fast ones wherever they were imported:
+    cmu_graphics' own modules, the package (including its translated aliases,
+    e.g. the Spanish names), and the game itself if it already did
+    `from cmu_graphics import *`."""
+    main = sys.modules.get('__main__')
+    spaces = [cg.__dict__, sl.__dict__, vars(_pkg)]
+    if main is not None:
+        spaces.append(main.__dict__)
+    for g in spaces:
+        for name, value in list(g.items()):
+            new = swaps.get(id(value))
+            if new is not None and new[0] is value:
+                g[name] = new[1]
+
+
+def install():
     global _DEFAULT_RECT
     # Fewer, cheaper GC passes: every frame allocates many short-lived objects,
     # and the big module-level tables never need rescanning.
     gc.freeze()
     gc.set_threshold(20000, 20, 20)
 
-    sl.toEnglish = toEnglish
-    sl.t = t
-    for g in (cg.__dict__, pkgGlobals):
-        if g.get('toEnglish') is not None:
-            g['toEnglish'] = toEnglish
-        if g.get('t') is not None:
-            g['t'] = t
-        if g.get('rgb') is not None:
-            g['rgb'] = rgb
+    swaps = {}  # id(original) -> (original, replacement)
+
+    def swap(orig, new):
+        swaps[id(orig)] = (orig, new)
+
+    swap(_origToEnglish, toEnglish)
+    swap(_origT, t)
+    swap(cg.__dict__['rgb'], rgb)
     _DEFAULT_RECT = style({}, _SHAPE_KW, 'left-top')
     # Same hash as RGB.__hash__, without three trips through the translating __getattr__.
     sl.RGB.__hash__ = lambda c: hash((c.__dict__['_red'], c.__dict__['_green'], c.__dict__['_blue']))
 
     cg.App.redrawAllWrapper = redrawAllWrapper
     cg.App.redrawAll = redrawAll
-    cg.App.updateScreen = updateScreen
+    cg.App.on_event = onEvent
     S.layer = StaticPrefix()
     S.fit = os.environ.get('CMU_FIT') == '1'
-    S.antialias = {'fast': cairo.ANTIALIAS_FAST, 'none': cairo.ANTIALIAS_NONE}.get(
-        os.environ.get('CMU_ANTIALIAS', ''))
-    S.joy = os.environ.get('CMU_R36S_JOY') == '1'
-    if S.joy or S.fit:
-        pygame.event.get = eventGet
-    installSound()
+    try:
+        S.mvcEvery = max(0, int(os.environ.get('CMU_MVC_CHECK', '1')))
+    except ValueError:
+        S.mvcEvery = 1
+    if S.fit:
+        object.__getattribute__(cg.app, '_app')._fullscreen = True
 
     for name, builder in _BUILDERS.items():
-        fast = makeFastDrawFn(builder, cg.__dict__[name])
-        cg.__dict__[name] = fast
-        if name in pkgGlobals:
-            pkgGlobals[name] = fast
+        orig = cg.__dict__[name]
+        swap(orig, makeFastDrawFn(builder, orig))
+    _replaceEverywhere(swaps)
+
+
+if os.environ.get('CMU_FAST', '1') != '0' and not getattr(cg, '_fastpathInstalled', False):
+    cg._fastpathInstalled = True
+    print('Enabling fast path')
+    install()
