@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # setup.sh: prepare an R36S SD card (dArkOS) for cmu_graphics games, from a Linux PC.
 #
-#   ROOTFS partition:    cmu_graphics (with the fastpath speed patches), cmu_graphics_helpers, certifi, pygame (for joystick.py) and the WHEELS packages, in /usr/local/lib/python3.13/dist-packages
+#   ROOTFS partition:    cmu_graphics, cmu_graphics_helpers, certifi, pygame (for joystick.py) and the WHEELS packages, in /usr/local/lib/python3.13/dist-packages
 #                        the cage Wayland kiosk and its libraries (Debian trixie arm64), in /usr/local/lib/r36s-cage
 #   EASYROMS partition:  ports/cmu_libs (the shared launcher) and the demo games; empty folders are removed
 #   Also removed, to keep the menus simple: Kodi and RetroArch, PICO-8 carts, ScummVM and "Scan for new games" entries
@@ -113,12 +113,20 @@ done
 # ---------------------------------------------------------------- downloads (pinned)
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/r36s-cmu"
 mkdir -p "$CACHE"
-# cmu_graphics_helpers has no aarch64 wheel on PyPI, so a prebuilt one ships in wheels/.
-HELPERS_WHL=cmu_graphics_helpers-0.1.11-cp38-abi3-linux_aarch64.whl
-HELPERS_SHA=4bf4dacf4080bc6313dd550f3c25fb77598f981ca7132d4ac8879e23591a9748
-[ -f "$HERE/wheels/$HELPERS_WHL" ] || die "wheels/$HELPERS_WHL is missing"
-echo "$HELPERS_SHA  $HERE/wheels/$HELPERS_WHL" | sha256sum -c --quiet - || die "wheels/$HELPERS_WHL doesn't match its checksum"
-cp "$HERE/wheels/$HELPERS_WHL" "$CACHE/$HELPERS_WHL"
+# cmu_graphics and cmu_graphics_helpers ship prebuilt in wheels/ instead of coming from PyPI:
+# cmu_graphics_helpers has no aarch64 wheel there, and cmu_graphics is a locally built 3.0.2.post1.
+LOCAL_WHEELS=(
+  "cmu_graphics-3.0.2.post1-py3-none-any.whl 1afe3d15d6580c059349bc2b71b48843401ee9f6fdeee444b3b8a9c5feb693ea"
+  "cmu_graphics_helpers-0.1.11-cp38-abi3-linux_aarch64.whl a7c805d28947727f2285964dc419e94c479c20f357c812347941627bb8b0720b"
+)
+WHEEL_FILES=()
+for wheel in "${LOCAL_WHEELS[@]}"; do
+  whl=${wheel% *}
+  [ -f "$HERE/wheels/$whl" ] || die "wheels/$whl is missing"
+  echo "${wheel##* }  $HERE/wheels/$whl" | sha256sum -c --quiet - || die "wheels/$whl doesn't match its checksum"
+  cp "$HERE/wheels/$whl" "$CACHE/$whl"
+  WHEEL_FILES+=("$whl")
+done
 
 # pygame, which joystick.py uses to read the gamepad (cmu_graphics itself no longer needs it)
 PYGAME_DEB=python3-pygame_2.6.1-1+b2_arm64.deb
@@ -130,7 +138,6 @@ fetch "https://deb.debian.org/debian/pool/main/p/pygame/$PYGAME_DEB" \
 # Packages students can import. PyPI's manylinux wheels bundle their own native libraries.
 PYPI=https://files.pythonhosted.org/packages
 WHEELS=(
-  "$PYPI/7f/ca/5de5b637f4b79d9d520a0cb872e35f4cc9399a6b5f5571696b2f029a91f6/cmu_graphics-3.0.2-py3-none-any.whl 10ef13c1f9b4010aef2541e0fa5ea0ef378ec8022c9511280780b4d775e42eef"
   "$PYPI/32/d1/a3652fe2c19134d0d15922177821d863cbd7e842d53a21bbe7e8e3a1b5ac/certifi-2026.10.23-py3-none-any.whl e9b54de76e530bb6cf0ccd036787103acb58fd42ba930ea8bf948ddbaa2f61d1"
   "$PYPI/fb/3c/cd0770e96d20bfd990db024bcbd43897ff3e88da1f4782cf90ea231b1d4f/pillow-13.0.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl 19b66ca0a4d25cc0200b381ce824c7ea090db61427315e73cfb05dbf1b35c369"
   "$PYPI/57/06/de83b859944409bb9058bc6110581a3d7fc1f54d6df1222744911d7f6b19/numpy-2.5.5-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl ae2b8285d0b4eed24739c3ca9ec0fa424a0247489c01e1d5fe2815a599e11d33"
@@ -141,8 +148,7 @@ WHEELS=(
   "$PYPI/9c/95/2964da9ffb3dc5ed0fad8a6e9ae93d8c344ce633efe6ef8de61e4fd8777a/pathfinding-1.0.23-py3-none-any.whl 06259dc0831c5e3b77b394c4f0073d79ae67542d89ad92a88881984a824df408"
   "$PYPI/35/e0/fd0a2d2b93599dec876158fe7fccb8c3e8096844a5a4110dd5bc67377128/PyTMX-3.32-py3-none-any.whl 4da4c01133dfcb2746cb4e7f46ea1aef21d56119ab044f8f77b9906dea5fbccb"
 )
-say "downloading cmu_graphics 3.0.2, certifi, Pillow, numpy, pymunk, perlin-noise, pathfinding and pytmx"
-WHEEL_FILES=("$HELPERS_WHL")
+say "downloading certifi, Pillow, numpy, pymunk, perlin-noise, pathfinding and pytmx"
 for wheel in "${WHEELS[@]}"; do
   url=${wheel% *}
   WHEEL_FILES+=("$(basename "$url")")
@@ -286,23 +292,9 @@ FONT="$ROOTFS/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 if [ -f "$FONT" ]; then cp "$FONT" "$STAGE/site/pygame/freesansbold.ttf"
 else warn "no DejaVu Sans Bold found: pygame.font.Font(None) won't work (joystick.py doesn't need it)"; fi
 
-# Fixes for cmu_graphics bugs (see cmu_fixes.py), then the speed patches for slow
-# handhelds (see fastpath.py). Importing each module applies it, so every game gets them
-# without importing anything; CMU_FAST=0 turns the speed patches off.
-cp "$HERE/payload/cmu_fixes.py" "$STAGE/site/cmu_graphics/cmu_fixes.py"
-cp "$HERE/payload/fastpath.py" "$STAGE/site/cmu_graphics/fastpath.py"
-cat >> "$STAGE/site/cmu_graphics/__init__.py" <<'EOF'
-
-# R36S: fixes for cmu_graphics bugs (see cmu_fixes.py).
-from cmu_graphics import cmu_fixes as _cmu_fixes
-
-# R36S: speed patches for slow handhelds (see fastpath.py). CMU_FAST=0 disables them.
-from cmu_graphics import fastpath as _fastpath
-EOF
-
 # ---------------------------------------------------------------- assemble the ports folder
 cp "$HERE/payload/launch.sh" "$STAGE/ports/cmu_libs/"
-echo "r36s-cmu $(date +%Y-%m-%d): cmu_graphics 3.0.2 + fastpath, cmu_graphics_helpers 0.1.11, pygame 2.6.1, cage 0.2.0" > "$STAGE/ports/cmu_libs/VERSION"
+echo "r36s-cmu $(date +%Y-%m-%d): cmu_graphics 3.0.2.post1, cmu_graphics_helpers 0.1.11, pygame 2.6.1, cage 0.2.0" > "$STAGE/ports/cmu_libs/VERSION"
 
 # A game is a folder plus a menu entry with the same name.
 DEMOS=("joystick_tester:Joystick Tester" "cmu_swarm:CMU Swarm" "cmu_fps_demo:CMU FPS Demo")

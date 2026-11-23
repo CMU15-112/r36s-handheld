@@ -46,9 +46,9 @@ $ESUDO sh -c 'echo performance > /sys/devices/system/cpu/cpufreq/policy0/scaling
 # for the screen. pixman renders in software, since the console's GPU driver isn't needed.
 # CI=1 stops cmu_graphics' stdin console, which would quit the game. CMU_R36S_JOY=1 makes
 # joystick.py renumber the R36S pad like the arcade box, with Select+Start to quit.
-# CMU_FIT=1 makes fastpath scale any app size to the 640x480 screen. CMU_MVC_CHECK=0 turns
-# off the MVC checker, which hashes all of app twice a frame. CMU_APPROX=1 turns on
-# fastpath's near-identical speedups (cached glyphs, pre-rotated images). PYTHONUNBUFFERED=1
+# CMU_GRAPHICS_SKIP_FRAMES=1 lets cmu_graphics skip frames it can't draw in time.
+# CMU_GRAPHICS_DISABLE_MVC_CHECKER=1 turns off the MVC checker, which hashes all of app
+# twice a frame. PYTHONUNBUFFERED=1
 # keeps the last prints: cmu_graphics exits without flushing them into the log's pipe.
 # cage exits when the game does.
 CAGE=/usr/local/lib/r36s-cage
@@ -63,7 +63,7 @@ $ESUDO env \
   WLR_LIBINPUT_NO_DEVICES=1 \
   CI=1 \
   "$CAGE/bin/cage" -d -- \
-  env LD_LIBRARY_PATH="$CAGE/client" CMU_R36S_JOY=1 CMU_FIT=1 CMU_MVC_CHECK=0 CMU_APPROX=1 PYTHONUNBUFFERED=1 PYGAME_HIDE_SUPPORT_PROMPT=1 \
+  env LD_LIBRARY_PATH="$CAGE/client" CMU_R36S_JOY=1 CMU_GRAPHICS_SKIP_FRAMES=1 CMU_GRAPHICS_DISABLE_MVC_CHECKER=1 PYTHONUNBUFFERED=1 PYGAME_HIDE_SUPPORT_PROMPT=1 \
   python3 "$GAME_MAIN" < /dev/null
 
 $ESUDO sh -c 'printf "\033c" > /dev/tty0'

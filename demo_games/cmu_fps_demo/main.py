@@ -8,7 +8,7 @@ N_BALLS = 40
 STATS = {"frames": 0, "drawTime": 0.0}
 
 def onAppStart(app):
-    app.stepsPerSecond = 60  # ask for 60 so we see the real ceiling
+    app.stepsPerSecond = 1000  # ask for 1000 so we see the real ceiling
     app.x, app.y = 320, 240
     app.lastButton = 'none'
     app.balls = [[randrange(640), randrange(480), choice([-3, 3]), choice([-3, 3])]
