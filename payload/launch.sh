@@ -48,8 +48,9 @@ $ESUDO sh -c 'echo performance > /sys/devices/system/cpu/cpufreq/policy0/scaling
 # joystick.py renumber the R36S pad like the arcade box, with Select+Start to quit.
 # CMU_GRAPHICS_SKIP_FRAMES=1 lets cmu_graphics skip frames it can't draw in time.
 # CMU_GRAPHICS_DISABLE_MVC_CHECKER=1 turns off the MVC checker, which hashes all of app
-# twice a frame. PYTHONUNBUFFERED=1
-# keeps the last prints: cmu_graphics exits without flushing them into the log's pipe.
+# twice a frame. CMU_GRAPHICS_APPROX=1 turns on near-identical drawing speedups.
+# PYTHONUNBUFFERED=1 keeps the last prints: cmu_graphics exits without flushing them into
+# the log's pipe.
 # cage exits when the game does.
 CAGE=/usr/local/lib/r36s-cage
 RUNTIME=/tmp/r36s-cage-runtime
@@ -63,7 +64,7 @@ $ESUDO env \
   WLR_LIBINPUT_NO_DEVICES=1 \
   CI=1 \
   "$CAGE/bin/cage" -d -- \
-  env LD_LIBRARY_PATH="$CAGE/client" CMU_R36S_JOY=1 CMU_GRAPHICS_SKIP_FRAMES=1 CMU_GRAPHICS_DISABLE_MVC_CHECKER=1 PYTHONUNBUFFERED=1 PYGAME_HIDE_SUPPORT_PROMPT=1 \
+  env LD_LIBRARY_PATH="$CAGE/client" CMU_R36S_JOY=1 CMU_GRAPHICS_SKIP_FRAMES=1 CMU_GRAPHICS_DISABLE_MVC_CHECKER=1 CMU_GRAPHICS_APPROX=1 PYTHONUNBUFFERED=1 PYGAME_HIDE_SUPPORT_PROMPT=1 \
   python3 "$GAME_MAIN" < /dev/null
 
 $ESUDO sh -c 'printf "\033c" > /dev/tty0'

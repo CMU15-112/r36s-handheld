@@ -116,8 +116,8 @@ mkdir -p "$CACHE"
 # cmu_graphics and cmu_graphics_helpers ship prebuilt in wheels/ instead of coming from PyPI:
 # cmu_graphics_helpers has no aarch64 wheel there, and cmu_graphics is a locally built 3.0.2.post1.
 LOCAL_WHEELS=(
-  "cmu_graphics-3.0.2.post1-py3-none-any.whl 1afe3d15d6580c059349bc2b71b48843401ee9f6fdeee444b3b8a9c5feb693ea"
-  "cmu_graphics_helpers-0.1.11-cp38-abi3-linux_aarch64.whl a7c805d28947727f2285964dc419e94c479c20f357c812347941627bb8b0720b"
+  "cmu_graphics-3.0.2.post1-py3-none-any.whl 448b71a505037484061708812392420e7186b3fe6f067381b1ffa067153e0e28"
+  "cmu_graphics_helpers-0.1.11-cp38-abi3-linux_aarch64.whl 30e93c5be6ca10202d5fa257729e0c4a65c56716f8f0bca19fa024edb2327360"
 )
 WHEEL_FILES=()
 for wheel in "${LOCAL_WHEELS[@]}"; do

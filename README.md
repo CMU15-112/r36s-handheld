@@ -82,7 +82,8 @@ EASYROMS/ports/My Game.sh
 
 Every menu entry is a copy of [payload/game.sh](payload/game.sh), which runs
 `ports/cmu_libs/launch.sh`. The launcher finds the game folder from the entry's filename,
-turns on frame skipping (`CMU_GRAPHICS_SKIP_FRAMES=1`) and turns off the MVC checker
+turns on frame skipping (`CMU_GRAPHICS_SKIP_FRAMES=1`) and near-identical drawing speedups
+(`CMU_GRAPHICS_APPROX=1`), and turns off the MVC checker
 (`CMU_GRAPHICS_DISABLE_MVC_CHECKER=1`) to save frame time, pins the clocks at their maximum, and sends the game's output to `log.txt` in its folder.
 
 cmu_graphics 3 opens a Wayland window, and dArkOS has no desktop, so the launcher runs
