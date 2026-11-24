@@ -1,13 +1,5 @@
 import os
 
-try:
-    # Use this to import pygame if cmu_graphics was installed via zip file
-    from cmu_graphics.libs import pygame_loader as pygame
-except:
-    # Use this to import pygame if we couldn't use pygame_loader
-    os.environ.setdefault('PYGAME_HIDE_SUPPORT_PROMPT', '1')
-    import pygame
-
 from cmu_graphics import almostEqual, onStepEvent
 
 try:
@@ -15,10 +7,25 @@ try:
     from cmu_graphics import pygameEvent
 except ImportError:
     # cmu_graphics 3.x doesn't use pygame, so we read the joystick events ourselves
-    # in handleOnStepEvent. pygame's event queue needs its display started, so start
-    # one of SDL's windowless displays. Not every SDL build has both: the R36S's has
-    # only "offscreen".
+    # in handleOnStepEvent.
     pygameEvent = None
+
+try:
+    try:
+        # Use this to import pygame if cmu_graphics 1.x was installed via zip file
+        from cmu_graphics.libs import pygame_loader as pygame
+    except ImportError:
+        # Otherwise use the normally installed pygame
+        os.environ.setdefault('PYGAME_HIDE_SUPPORT_PROMPT', '1')
+        import pygame
+except ImportError:
+    pygame = None
+    print("joystick.py: pygame is not installed, so joystick support is disabled. "
+          "(Your program will still run; joystick callbacks just won't be called.)")
+
+if pygame is not None and pygameEvent is None:
+    # pygame's event queue needs its display started, so start one of SDL's windowless
+    # displays. Not every SDL build has both: the R36S's has only "offscreen".
     os.environ.setdefault('SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS', '1')
     _drivers = ['dummy', 'offscreen']
     if os.environ.get('SDL_VIDEODRIVER'):
@@ -27,11 +34,13 @@ except ImportError:
         os.environ['SDL_VIDEODRIVER'] = _driver
         try:
             pygame.display.init()
+            pygame.joystick.init()
             break
-        except pygame.error:
+        except pygame.error as _e:
             if _driver == _drivers[-1]:
-                raise
-    pygame.joystick.init()
+                pygame = None
+                print(f"joystick.py: couldn't start pygame ({_e}), so joystick support "
+                      "is disabled. (Your program will still run.)")
 
 _allJoyButtonsDown = dict()
 _allDigitalJoyAxisDown = dict()
@@ -70,7 +79,7 @@ def handlePygameEvent(event, callUserFn, app):
         callUserFn('onJoyAxis', (event.value, event.axis, event.instance_id))
 
 
-if pygameEvent is not None:
+if pygame is not None and pygameEvent is not None:
     pygameEvent.connect(handlePygameEvent)
 
 
@@ -78,7 +87,7 @@ if pygameEvent is not None:
 # box (see STUDENT_GUIDE.md). a/b/x/y, L1/R1 and L2/R2 already match; Select/Start move
 # to 8/9 like the arcade box; L3/R3 take 10/11. The D-pad becomes axes 0/1, like the
 # left stick. Pressing Select and Start together quits.
-R36S = os.environ.get('CMU_R36S_JOY') == '1'
+R36S = pygame is not None and os.environ.get('CMU_R36S_JOY') == '1'
 R36S_BUTTONS = {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7, 12: 8, 13: 9, 14: 10, 15: 11}
 R36S_DPAD = {8: (1, -1), 9: (1, 1), 10: (0, -1), 11: (0, 1)}  # raw button -> (axis, direction)
 R36S_SELECT, R36S_START = 12, 13
@@ -131,7 +140,8 @@ def handleOnStepEvent(callUserFn, app):
             callUserFn('onDigitalJoyAxis', (list(_allDigitalJoyAxisDown[joystick]), joystick))
             _digitalJoyAxisSendEmpty[joystick] = False
 
-onStepEvent.connect(handleOnStepEvent)
+if pygame is not None:
+    onStepEvent.connect(handleOnStepEvent)
 
 
 def handleJoyPress(button, joystick, callUserFn):
